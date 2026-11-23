@@ -1,0 +1,11 @@
+option('build_tests', type : 'boolean', value : true,
+       description : 'Build Vater unit, conformance, and render golden tests')
+option('build_bench', type : 'boolean', value : true,
+       description : 'Build Vater performance benchmarks')
+option('build_fuzz', type : 'boolean', value : false,
+       description : 'Build libFuzzer target for VT parser (requires clang++)')
+option('install_terminfo', type : 'boolean', value : true,
+       description : 'Compile and install terminfo/vater.ti')
+option('nisaba_layout_dir', type : 'string', value : '/home/x/Desktop/Nisaba/nisaba-layout/include',
+       description : 'Path to nisaba-layout headers if not installed under /usr/include/nisaba/layout')
+

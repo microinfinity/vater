@@ -1,0 +1,24 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Vater
+GenericName=Terminal Emulator
+Comment=Sovereign native GPU-accelerated terminal emulator on the Nisaba engine
+Exec=vater
+TryExec=vater
+Icon=vater
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;prompt;command;commandline;console;vater;
+StartupNotify=true
+StartupWMClass=vater
+Actions=new-window;quake;
+
+[Desktop Action new-window]
+Name=New Window
+Exec=vater
+
+[Desktop Action quake]
+Name=Quake Drop-Down Terminal
+Exec=vater --quake
+

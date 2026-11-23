@@ -1,63 +1,378 @@
-# 🚀 VAXP Terminal (vater)
+# Vater
 
-Vater is the official terminal application for the VAXP-OS distribution. It aims to balance advanced aesthetics ("Vanta Class") with high performance. The UI is built with Flutter while core terminal work uses custom FFI libraries for efficient I/O and PTY emulation.
+Native C++20 GPU-accelerated terminal emulator and persistent session daemon built on the **Nisaba** graphics, text, layout, and OS abstraction engine.
 
-## ✨ Key Features
-
-- **Vanta Class Aesthetics:** Built on VAXP-OS design language with a Black Acrylic / Blur effect to enhance the desktop experience.
-- **Superior FFI Performance:** Uses custom FFI libraries written in system languages to deliver efficient I/O processing and PTY emulation. Targets very low memory usage (under ~60MB idle).
-- **Stability in Complex Environments:** Architectural decisions and suggested isolation deployment (Flatpak, etc.) help keep the app stable across different Linux systems.
-- **Advanced Stream Handling:** Designed to handle complex interactive terminal programs (for example, htop) with low latency and high responsiveness.
-
-## Building and Running (Linux)
-
-Vater's UI is implemented with Flutter and uses native FFI libraries for core functionality.
-
-### Prerequisites
-
-- Flutter SDK (with Linux desktop support enabled)
-- Linux development toolchain: GCC or Clang, CMake, Ninja
-- Any additional native libraries required by the FFI components (platform-specific)
-
-### Build steps
-
-Clone the repository and fetch packages:
-
-```bash
-git clone <vater repository link>
-cd vater
-flutter pub get
-```
-
-Build for Linux:
-
-```bash
-flutter build linux
-```
-
-### Run (after building)
-
-Run the built binary (release):
-
-```bash
-./build/linux/x64/release/vater
-```
-
-## ⚖️ License (VAXPECO)
-
-This project is licensed under the VAXPECO (VAXP Ecosystem Open License).
-
-VAXPECO grants broad freedom to use, modify, distribute, and relicense the code (including the right to close-source derived works).
-
-### 📜 Conditional Attribution Requirement
-
-The project places a conditional requirement on re-using the `vater` name or attributing a modified app to VAXP-OS. Attribution is only permitted if **both** of the following are met:
-
-1. **Aesthetic Criteria (Vanta Class):** The modified project preserves the core Vanta Class / Black Glass visual style and does not remove or substantially alter the essential documented visual features.
-2. **Performance Criteria:** The modified project meets or exceeds the documented performance targets (for example, similar or better memory characteristics — ~65MB idle as documented).
-
-This requirement is intended to encourage either (a) respectful preservation of the VAXP identity when keeping the same name, or (b) differentiation under a new name when those criteria are not met.
+Vater is implemented with strict layer isolation and zero external third-party dependencies beyond `libc`, POSIX APIs, Linux syscalls, and Nisaba.
 
 ---
 
-If you need extra help (for example, adding build instructions for development mode, CI steps, or packaging with Flatpak), tell me what you'd like and I can add it to this README.
+## Architecture
+
+The codebase is partitioned into five strict architectural layers:
+
+```text
++-------------------------------------------------------------------+
+| L5: Shell UI & Configuration (src/ui/, src/config/, src/main.cpp) |
+|     CSD frame, TabBar, ContextMenu, SearchOverlay, CommandPalette,|
+|     PreviewPanel, QuakeMode, InputEncoder, JSON config + inotify  |
++-------------------------------------------------------------------+
+| L4: Rendering & Typography (src/render/)                          |
+|     FontStack, BiDi/Arabic/Ligature LineShaper, Subpixel Atlas,   |
+|     3-pass GPU CellRenderer, CPU Fallback Renderer, VSPR Damage   |
++-------------------------------------------------------------------+
+| L2: Multiplexer & Session Daemon (src/mux/)                       |
+|     Session (Local PTY / Remote vaterd / Asciicast v2),           |
+|     PaneTree (nisaba-layout Flexbox), vaterd (standalone daemon)  |
++-------------------------------------------------------------------+
+| L3: Terminal Core (src/vt/ -> libterm_core.a)                     |
+|     Strictly isolated: zero Nisaba or GUI headers/symbols         |
+|     VT500 Parser, UTF-8 DFA + SIMD scanner, Grid, Reflow,         |
+|     Paged Scrollback, Dispatcher, Sixel & APC G GraphicsStore     |
++-------------------------------------------------------------------+
+| L1: OS & Process Layer (src/os/ -> libvater_os.a)                 |
+|     POSIX PTY, fork/setsid/close_range/execve, epoll/eventfd,     |
+|     Framed binary AF_UNIX IPC with SO_PEERCRED UID verification   |
++-------------------------------------------------------------------+
+```
+
+### Layer & Dependency Invariants
+
+- **`libterm_core.a` (L3)** has zero dependency on Nisaba or any windowing/graphics library. Image decoding (`PNG`) and stream decompression (`zlib`) are injected from L4 via `std::function` callbacks.
+- **`vaterd` (L2 daemon)** links only against `libvater_os.a` and POSIX threads (zero GUI or Nisaba linkage).
+- **Platform abstraction (L5)** routes all display server, input, clipboard, drag-and-drop, cursor, and layer-shell operations exclusively through `nisaba::backend_os::Platform`.
+
+---
+
+## Technical Specifications
+
+### Terminal Core (`src/vt/`)
+
+- **Parser**: State-machine VT500 parser paired with a branchless UTF-8 DFA and SSE2/AVX2 printable-ASCII fast-path scanner (`scan_printable_ascii`).
+- **Unicode Width**: Unicode 16 `wcwidth`, combining marks, and emoji width tables generated by `scripts/gen_wcwidth.py` into `src/vt/wcwidth.hpp`.
+- **Cell Layout**: Fixed 16-byte `Cell` representation (`char32_t cp`, packed 32-bit `fg`/`bg` supporting default/ANSI-16/256-color/24-bit RGB, 16-bit style attributes, and 16-bit extended-data pool handle for underline color, OSC 8 hyperlink IDs, and grapheme clusters).
+- **Grid & Reflow**:
+  - `O(1)` ring-indexed main screen buffer with AVX2 blank-row fill.
+  - Logical line-wrap tracking and full content reflow on resize preserving cursor coordinates.
+  - DECSTBM top/bottom scroll margins, DECSLRM left/right margins, DECOM origin mode, and alternate screen buffer.
+- **Scrollback Buffer**:
+  - 256-line paged ring buffer (configurable up to 2,000,000 lines; default 100,000).
+  - Compact ASCII storage lane (16:1 compression ratio for plain ASCII lines), uniform RLE, raw cell slab fallback, page recycling, and optional `mmap` spill (`scrollback_mmap_spill`).
+- **Protocol & Sequence Support**:
+  - **VT / ECMA-48 / DEC**: C0/C1 controls, CSI cursor/editing/scrolling/tab/status queries (`DA1`/`DA2`/`DSR`/`CSI 14t`/`16t`/`18t`), DEC private modes including `DEC 1004` focus reporting, `DEC 1007` alternate scroll, `DEC 2004` bracketed paste, and `DEC 2026` synchronized output (with a 200 ms freeze safety timeout).
+  - **SGR**: Bold, dim, italic, inverse, invisible, strikethrough, overline, underline styles (`Single`, `Double`, `Curly`, `Dotted`, `Dashed`), independent underline color (`58:2`/`58:5`), ANSI-16, 256-color, and 24-bit TrueColor.
+  - **OSC**: `OSC 0`/`2` title, `OSC 4`/`10`/`11`/`12` and `104`/`110`/`111`/`112` dynamic palette colors, `OSC 7`/`1337` working directory, `OSC 8` hyperlinks, `OSC 52` clipboard access, and `OSC 133` semantic prompt/command markers (`A`/`B`/`C`/`D`).
+  - **Inline Graphics**:
+    - `DCS q` Sixel decoding.
+    - `APC G` inline image protocol: raw 24-bit RGB (`f=24`), 32-bit RGBA (`f=32`), PNG (`f=100`), zlib decompression (`o=z`), direct (`t=d`), file (`t=f`), temporary file (`t=t`), and POSIX shared-memory (`t=s`, `shm_open` + `mmap` + `shm_unlink`) transfer media, chunked streaming (`m=1`/`m=0`), slice offset/size (`O`/`S`), `z`-index layering (behind or over text), aspect-ratio preservation when specifying `c` or `r` alone, cursor advancement (`C=0`/`C=1`), and automatic placement scrolling synchronized with grid scroll-up.
+  - **Input Encoding**: Standard VT/modifier sequences, `CSI u` enhanced keyboard protocol (disambiguate, report events, report alternate keys, report all keys, associated text), X10/SGR/SGR-Pixels mouse tracking, and bracketed paste.
+
+### Typography & Rendering (`src/render/`)
+
+- **Font Stack**: Monospace font verification (`adv('i') == adv('M')`), Regular/Bold/Italic/Bold-Italic face resolution with synthetic fallback when needed, and ordered fallback chain for symbols, Arabic script, and color emoji.
+- **Line Shaping**:
+  - Per-line implicit Bidirectional (BiDi) layout and Arabic contextual shaping via `nisaba::text::Bidi` (display-only; backing logical cell buffer and cursor semantics remain intact).
+  - Optional OpenType GSUB programming ligatures.
+- **Glyph Atlas & Procedural Symbols**:
+  - 4-bin subpixel GPU glyph atlas (`SovereignGlyphAtlas`).
+  - Procedural vector rendering for box-drawing characters (including curved arcs `╭╮╰╯`), block elements, Braille patterns, and Powerline glyphs.
+  - Built-in `8x16` bitmap fallback for missing codepoints.
+- **Rendering Backends**:
+  - **GPU Backend (default)**: 3-pass batched `nisaba::gpu::Context::drawTriangles` pipeline (coalesced same-color background quads, textured atlas glyphs, decorations & cursor), plus inline images and curly underline vector paths.
+  - **Software Fallback (`--software`)**: Pure CPU rasterization onto `nisaba::Pixmap` via `nisaba::Canvas` with full inline image, BiDi, procedural box-drawing, and decoration support.
+  - **Damage Tracking**: Per-row and single-cell cursor-blink damage aggregated via `vspr::TiledSpanTracker<16>` and forwarded to `Window::setDamage`.
+  - **Post-Processing**: Optional CRT scanline/curvature shader via Nisaba `RuntimeEffect`.
+
+### Multiplexer, Daemon & UI (`src/mux/`, `src/ui/`)
+
+- **Tabs & Splits**: Binary split pane tree solved via `nisaba-layout` Flexbox engine, interactive mouse divider dragging, keyboard directional focus navigation, and single-pane zoom toggle.
+- **Persistent Session Daemon (`vaterd`)**: Hosts PTY sessions over `$XDG_RUNTIME_DIR/vater/vaterd.sock`. Closing a client window detaches remote sessions without terminating child processes; sessions can be listed and reattached from any client instance.
+- **Asciicast v2**: Live `.cast` JSON-lines output recording and timed playback (`--play FILE.cast`).
+- **Overlays & Interaction**:
+  - Client-Side Decorations (CSD) and live system theme synchronization over `ThemeClient`.
+  - Floating right-click Context Menu with GPU backdrop blur, keyboard/mouse navigation, and dynamic state entries.
+  - Interactive pane scrollbar thumb with hover expansion and click/drag scrubbing.
+  - Linear-time `O(N*M)` Thompson NFA regex scrollback search overlay (immune to catastrophic backtracking).
+  - Fuzzy-matched Command Palette.
+  - Integrated side Preview Panel (`--preview` or clicking `file://` links for Markdown, PDF, and image files).
+  - Quake drop-down overlay mode (`--quake`) via Wayland LayerSurface when available.
+  - Multi-click selection: drag, `Alt`+drag rectangular block, double-click word, triple-click line, and quad-click `OSC 133` command output.
+
+---
+
+## Security Model
+
+- **OSC 52 Clipboard**: Disabled by default (`osc52_write: false`, `osc52_read: false`). Write and read permissions are configured independently.
+- **Paste Protection**: When `confirm_multiline_paste` is enabled and the running program has not enabled `DEC 2004` bracketed paste, multiline or control-character clipboard payloads trigger an interactive confirmation banner (`Enter` to send, `Escape` to cancel).
+- **Hyperlinks (`OSC 8`)**: Hovering displays the raw destination URI. `http://`, `https://`, and `file://` URIs open directly (`file://` previewable documents open in the side panel); any other URI scheme requires explicit confirmation before invoking `xdg-open`.
+- **Daemon IPC (`vaterd`)**: Runtime directory is created with mode `0700`, socket with mode `0600`, and every peer connection is validated against the daemon process UID using `SO_PEERCRED`.
+
+---
+
+## Build & Installation
+
+### Requirements
+
+- C++20 compiler (`g++ >= 13` or `clang++ >= 16`)
+- `meson >= 1.0` and `ninja`
+- Installed **Nisaba** (`nisaba` pkg-config package, `libnisaba_backend_os`, and `nisaba-layout` headers)
+- Linux system libraries linked by Nisaba (`wayland-client`, `gl`, `glew`, `pthread`, `dl`, `m`, `rt`)
+
+### Build Steps
+
+```bash
+meson setup build --prefix=/usr --buildtype=release
+ninja -C build -j 4
+```
+
+### Meson Options (`meson_options.txt`)
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `build_tests` | `boolean` | `true` | Build unit, conformance, IPC, and CPU golden render tests |
+| `build_bench` | `boolean` | `true` | Build VT throughput and memory benchmarks |
+| `build_fuzz` | `boolean` | `false` | Build `fuzz_parser` (`libFuzzer` + ASan/UBSan; requires `clang++`) |
+| `install_terminfo` | `boolean` | `true` | Ship `terminfo/vater.ti` |
+| `nisaba_layout_dir` | `string` | `/home/x/Desktop/Nisaba/nisaba-layout/include` | Path to `nisaba-layout` headers if not under `/usr/include/nisaba/layout` |
+
+### Install & Terminfo Compilation
+
+```bash
+meson install -C build
+```
+
+Installed artifacts:
+- Binaries: `vater`, `vaterd`
+- Desktop entry: `share/applications/vater.desktop`
+- Icon: `share/icons/hicolor/scalable/apps/vater.svg`
+- Terminfo source: `share/vater/terminfo/vater.ti`
+- Shell integration scripts: `share/vater/shell-integration/vater.{bash,zsh}`
+
+To compile and install the `vater` terminfo entry locally:
+
+```bash
+tic -x terminfo/vater.ti
+```
+
+By default `TERM` is set to `xterm-256color` for remote SSH compatibility; set `"term": "vater"` in `config.json` after compiling `vater.ti` to advertise extended capabilities directly.
+
+---
+
+## Command-Line Interface
+
+### `vater`
+
+```text
+vater [options] [-- command [args...]]
+```
+
+| Flag | Description |
+| --- | --- |
+| `-h`, `--help` | Print usage summary and exit |
+| `-v`, `--version` | Print version string and exit |
+| `-c`, `--config PATH` | Load configuration from a custom JSON file |
+| `-d`, `--dir PATH` | Set initial working directory |
+| `--quake` | Launch as a top-edge drop-down overlay (LayerSurface) |
+| `--software` | Force CPU software fallback renderer |
+| `--attach [SESSION_ID]` | Attach to a `vaterd` session (`0` or omitted creates a new session) |
+| `--list-sessions` | Query and print active `vaterd` sessions |
+| `--socket PATH` | Override `vaterd` Unix socket path |
+| `--preview FILE` | Open a Markdown, PDF, or image file in the side preview panel |
+| `--play FILE.cast` | Play back an Asciicast v2 recording |
+| `--dark` | Force dark theme |
+| `--light` | Force light theme |
+| `-e CMD [ARGS...]` / `-- CMD [ARGS...]` | Execute a specific command instead of the login shell |
+
+### `vaterd`
+
+```text
+vaterd [-s | --socket PATH]
+```
+
+Starts the persistent session daemon listening on `$XDG_RUNTIME_DIR/vater/vaterd.sock` (or the specified path).
+
+---
+
+## Configuration
+
+Default path: `$XDG_CONFIG_HOME/vater/config.json` (fallback `~/.config/vater/config.json`).
+Changes to the file are watched via Linux `inotify` and hot-reloaded without restarting active sessions. Parse errors report line-numbered diagnostics to `stderr`.
+
+### Configuration Keys
+
+| Key | Type | Default | Constraints / Notes |
+| --- | --- | --- | --- |
+| `font_family` | `string` | `"DejaVu Sans Mono"` | Primary monospace family |
+| `fallback_fonts` | `string[]` | `["Noto Sans Mono", "Cascadia Mono", "Liberation Mono", "Symbols Nerd Font Mono", "Noto Sans Arabic", "Noto Color Emoji"]` | Ordered fallback list |
+| `font_size` | `number` | `14.0` | Range `6.0` .. `96.0` |
+| `line_height` | `number` | `1.15` | Clamped to `0.8` .. `2.5` |
+| `ligatures` | `boolean` | `true` | OpenType GSUB ligatures |
+| `bidi_enabled` | `boolean` | `true` | Per-line implicit BiDi & Arabic shaping |
+| `shell` | `string` | `""` | Empty resolves to `$SHELL` |
+| `term` | `string` | `"xterm-256color"` | `TERM` environment value (`"vater"` optional) |
+| `scrollback_lines` | `integer` | `100000` | Range `0` .. `2000000` |
+| `scrollback_mmap_spill` | `boolean` | `false` | Spill evicted pages to `mmap` backing |
+| `word_delimiters` | `string` | `" \t\n\"'`()[]{}<>|;:,!?"` | Double-click word boundary characters |
+| `cursor_shape` | `string` | `"block"` | `"block"`, `"underline"`, or `"bar"` (`"beam"`) |
+| `cursor_blink` | `boolean` | `true` | Enable cursor blink timer |
+| `cursor_blink_ms` | `integer` | `530` | Range `100` .. `5000` ms |
+| `opacity` | `number` | `0.88` | Range `0.1` .. `1.0` |
+| `follow_system_theme` | `boolean` | `true` | Subscribe to live `ThemeClient` updates |
+| `blur_behind` | `boolean` | `true` | Backdrop blur behind translucent surfaces |
+| `crt_effect` | `boolean` | `false` | Enable CRT `RuntimeEffect` overlay |
+| `software_renderer` | `boolean` | `false` | Use CPU fallback renderer |
+| `padding_x` | `number` | `10.0` | Horizontal viewport padding (`0` .. `64`) |
+| `padding_y` | `number` | `8.0` | Vertical viewport padding (`0` .. `64`) |
+| `osc52_write` | `boolean` | `false` | Allow terminal apps to write clipboard via OSC 52 |
+| `osc52_read` | `boolean` | `false` | Allow terminal apps to read clipboard via OSC 52 |
+| `confirm_multiline_paste` | `boolean` | `true` | Prompt before multiline/control paste outside bracketed paste |
+| `palette` | `string[16]` | *(theme derived)* | Optional 16 `#RRGGBB` ANSI color overrides |
+| `keybindings` | `object` | *(see below)* | Map of `"Mod+Key": "action_name"` overrides |
+
+### Example `config.json`
+
+```json
+{
+  "font_family": "DejaVu Sans Mono",
+  "font_size": 14,
+  "line_height": 1.15,
+  "ligatures": true,
+  "bidi_enabled": true,
+  "scrollback_lines": 100000,
+  "cursor_shape": "block",
+  "opacity": 0.90,
+  "osc52_write": false,
+  "osc52_read": false,
+  "confirm_multiline_paste": true,
+  "keybindings": {
+    "Ctrl+Shift+D": "split_horizontal",
+    "Ctrl+Shift+E": "split_vertical"
+  }
+}
+```
+
+---
+
+## Default Keybindings
+
+| Shortcut | Action Name | Behavior |
+| --- | --- | --- |
+| `Ctrl+Shift+C` | `copy` | Copy selection to clipboard |
+| `Ctrl+Shift+V` | `paste` | Paste from clipboard |
+| `Ctrl+Shift+T` | `new_tab` | Open new tab (inherits focused pane CWD) |
+| `Ctrl+Shift+W` | `close_pane` | Close focused pane (or tab if last pane) |
+| `Ctrl+Tab` | `next_tab` | Switch to next tab |
+| `Ctrl+Shift+Tab` | `prev_tab` | Switch to previous tab |
+| `Ctrl+Shift+D` | `split_horizontal` | Split pane left / right |
+| `Ctrl+Shift+E` | `split_vertical` | Split pane top / bottom |
+| `Ctrl+Shift+Left/Right/Up/Down` | `focus_left` / `focus_right` / `focus_up` / `focus_down` | Move focus to adjacent pane |
+| `Ctrl+Shift+Z` | `toggle_zoom` | Toggle focused pane full-viewport zoom |
+| `Ctrl+=` / `Ctrl+Shift+=` | `font_increase` | Increase font size |
+| `Ctrl+-` | `font_decrease` | Decrease font size |
+| `Ctrl+0` | `font_reset` | Reset font size to config value |
+| `Ctrl+Shift+F` | `toggle_search` | Open/close regex scrollback search |
+| `Ctrl+Shift+P` | `toggle_command_palette` | Open/close command palette |
+| `Ctrl+Shift+B` | `toggle_bidi` | Toggle Arabic/BiDi display layout |
+| `Ctrl+Shift+L` | `toggle_ligatures` | Toggle OpenType ligatures |
+| `Ctrl+Shift+G` | `toggle_crt` | Toggle CRT shader overlay |
+| `Ctrl+Shift+M` | `toggle_preview` | Toggle side preview panel |
+| `Ctrl+Shift+K` | `clear_scrollback` | Clear scrollback history (`CSI 3 J`) |
+| `Ctrl+Shift+R` | `reload_config` | Reload `config.json` immediately |
+| `Shift+PageUp` / `Shift+PageDown` | `scroll_page_up` / `scroll_page_down` | Scroll viewport by one page |
+| `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | `prev_prompt` / `next_prompt` | Jump between `OSC 133` prompt markers |
+
+Additional bindable actions: `scroll_to_bottom`, `toggle_quake`, `toggle_recording`.
+
+---
+
+## Shell Integration
+
+Source the appropriate script to enable `OSC 133` prompt markers (exit-code badges, prompt jumping, quad-click command output selection) and `OSC 7` working directory tracking:
+
+**Bash (`~/.bashrc`)**:
+```bash
+source /usr/share/vater/shell-integration/vater.bash
+```
+
+**Zsh (`~/.zshrc`)**:
+```zsh
+source /usr/share/vater/shell-integration/vater.zsh
+```
+
+---
+
+## Testing, Fuzzing & Benchmarks
+
+### Test Suites
+
+```bash
+meson test -C build --verbose
+```
+
+| Suite | Coverage | Checks |
+| --- | --- | --- |
+| `vt_unit` | UTF-8 DFA, SIMD ASCII scanner, `wcwidth`, `Cell` 16-byte layout, scrollback RLE/eviction, grid reflow, Sixel, `APC G` (`o=z`, `t=s` shm, auto-scroll), POSIX PTY spawn | 44 |
+| `vt_conformance` | Cursor addressing, DECSTBM/DECSLRM/DECOM, SGR attributes, DEC modes, OSC 0/7/8/52/133, alternate screen, DEC 2026 sync output | 44 |
+| `regex_input_config_ipc` | Thompson NFA regex (incl. ReDoS check), `InputEncoder`, JSON config diagnostics, `vaterd` IPC + `SO_PEERCRED`, `ContextMenu`, `PaneTree`, Asciicast v2 playback | 35 |
+| `golden_cpu_render` | Deterministic headless CPU rendering, monospace glyph alignment guardrail, procedural box drawing, Arabic RTL BiDi layout | 9 |
+
+### Benchmarks
+
+```bash
+./build/bench_vt
+```
+
+Measured reference results (`-O3 -flto -march=native`, x86_64):
+
+| Metric | Measured | Target |
+| --- | --- | --- |
+| Raw ASCII Parser Throughput (100 MB) | `4.51 GB/s` (`0.022 s`) | `>= 1.00 GB/s` |
+| Full Terminal Pipeline (`cat 100 MB`) | `0.407 s` (`245.8 MB/s`) | `< 0.500 s` |
+| Scrollback Memory (10,000 lines) | `1,524 KB` | Compact paged RLE |
+
+### Layer Isolation & Dependency Verification
+
+```bash
+# Verify L3 term_core contains zero Nisaba symbols
+! nm build/libterm_core.a | grep -i nisaba
+
+# Inspect dynamic linkage of vater and vaterd
+ldd build/vater
+ldd build/vaterd
+```
+
+### Fuzzing
+
+```bash
+CXX=clang++ meson setup build-fuzz -Dbuild_fuzz=true
+ninja -C build-fuzz fuzz_parser
+./build-fuzz/fuzz_parser -max_total_time=60
+```
+
+---
+
+## Repository Layout
+
+```text
+.
+├── assets/                     # Freedesktop desktop entry (vater.desktop) and icon (vater.svg)
+├── core/                       # CSD window frame, theme client, shared UI styling
+├── docs/shell-integration/     # Bash & Zsh OSC 133 + OSC 7 integration scripts
+├── scripts/                    # Unicode 16 wcwidth table generator
+├── src/
+│   ├── config/                 # Typed JSON config schema, loader, inotify watcher, keymap
+│   ├── mux/                    # Session (local/remote/playback), PaneTree, vaterd daemon
+│   ├── os/                     # POSIX PTY, process spawn, epoll event loop, AF_UNIX IPC
+│   ├── render/                 # FontStack, LineShaper, Atlas, GPU/CPU renderers, VSPR damage, CRT effect
+│   ├── ui/                     # App controller, TabBar, ContextMenu, Search, Palette, Preview, Quake
+│   ├── vt/                     # Isolated L3 term_core (parser, grid, reflow, scrollback, graphics)
+│   └── main.cpp                # CLI entrypoint and Platform/GpuCanvas loop
+├── terminfo/vater.ti           # Terminfo capability definition
+├── tests/                      # Unit, conformance, CPU golden render, benchmark, and fuzz targets
+├── meson.build                 # Build and install definitions
+├── meson_options.txt           # Configurable build options
+└── package.sh                  # Debian (.deb) packaging script
+```
+
+---
+
+This project was developed by the MicroInfinity / VAXP organization team as a core unit integrated within the VAXP-OS operating system.
